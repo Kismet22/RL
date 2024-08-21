@@ -382,6 +382,7 @@ class HJB_PPO:
                 actions_on_device.append(torch.tensor(action, dtype=torch.float32, device=device))
         old_actions = torch.squeeze(torch.stack(actions_on_device, dim=0)).detach().to(device)  # 进行堆叠和其他操作
 
+        step_rewards = torch.squeeze(torch.stack(self.buffer.rewards, dim=0)).detach().to(device)
         old_logprobs = torch.squeeze(torch.stack(self.buffer.logprobs, dim=0)).detach().to(device)
         # old_state_values = torch.squeeze(torch.stack(self.buffer.state_values, dim=0)).detach().to(device)
 
@@ -412,17 +413,16 @@ class HJB_PPO:
             delta_states_f = torch.squeeze(old_states[1:, :] - old_states[:-1, :]).detach()
             state_values_f = torch.squeeze(state_values[:-1]).detach()
             state_gradients_f = torch.squeeze(state_gradients[:-1]).detach()
-            rewards_f = torch.squeeze(rewards[:-1]).detach()
+            rewards_f = torch.squeeze(step_rewards[:-1]).detach()
 
             # ▽_xV(x) * (x_t+1 - x_ t) / Δt
             transition_value = torch.sum(state_gradients_f * delta_states_f, dim=1) / 0.01
             mse_f = torch.mean((state_values_f * log_gamma + rewards_f + transition_value) ** 2)
 
             # MSE_U
-            rewards_t = torch.squeeze(rewards[:-1]).detach()  # r(t) 对应前面的时间步
             state_values_t = torch.squeeze(state_values[:-1]).detach()
             state_values_t1 = torch.squeeze(state_values[1:]).detach()  # v(t+1) 对应后面的时间步
-            mse_u = torch.mean((state_values_t - (rewards_t + torch.tensor(self.gamma) * state_values_t1)) ** 2)
+            mse_u = torch.mean((state_values_t - (rewards_f + torch.tensor(self.gamma) * state_values_t1)) ** 2)
 
             # 0.5 * MSE_u + λ_HJB * MSE_f
             loss_2 = 0.5 * mse_u + self.hjb_lamda * mse_f
@@ -441,9 +441,10 @@ class HJB_PPO:
             # final loss of clipped objective PPO
             # 第一项是给actor网络用的，第二项是给critic网络用的，第三项也是给actor的，避免策略过早收敛。
             # 虽然loss写在了一起，但两个网络会各自计算和自己相关的梯度，这没什么问题。
-            # loss = -torch.min(surr1, surr2) + 0.5 * self.MseLoss(state_values, rewards) - 0.01 * dist_entropy
-            loss = -torch.min(surr1, surr2) + loss_2 - 0.01 * dist_entropy
-            # take gradient step
+            loss = (-torch.min(surr1, surr2) + 0.5 * self.MseLoss(state_values, rewards) + loss_2 -
+                    0.01 * dist_entropy)
+
+
             # 梯度优化过程
             self.optimizer.zero_grad()
             loss.mean().backward()
