@@ -190,7 +190,7 @@ class HJB_PPO:
     def __init__(self, state_dim, action_dim, lr_actor, lr_critic,
                  gamma, K_epochs, eps_clip, has_continuous_action_space,
                  action_std_init=0.6, hidden_layer_dim=128,
-                 continuous_action_output_scale=1.0, continuous_action_output_bias=0.0):
+                 continuous_action_output_scale=1.0, continuous_action_output_bias=0.0, hjb_lamda=0.5):
         """
         PPO constructor.
         :param state_dim: 状态空间维数
@@ -204,6 +204,9 @@ class HJB_PPO:
         :param action_std_init: 连续动作空间的分布标准差
         :param continuous_action_output_scale: 连续动作空间时，将默认输出[-1, 1]缩放的倍数
         :param continuous_action_output_bias:  连续动作空间时，将默认输出[-1, 1]缩放后的偏置
+        # 解释:网络输出经过归一化，范围为[-1, 1]
+        # 实际动作空间范围为[a, b]
+        # 映射方式:scale = (b - a)/(1 - (-1)) bias = b - (b - a)/2 = (b + a)/2
         """
         self.has_continuous_action_space = has_continuous_action_space
 
@@ -242,6 +245,7 @@ class HJB_PPO:
 
         # 第二部分的损失值:A2C网络的MSE损失值
         self.MseLoss = nn.MSELoss()
+        self.hjb_lamda = hjb_lamda
 
     def set_action_std(self, new_action_std):
         if self.has_continuous_action_space:
@@ -284,6 +288,10 @@ class HJB_PPO:
             state = list(input_state.values())
         else:
             state = input_state
+
+        if isinstance(state, list):
+            state = torch.tensor(state, dtype=torch.float32).to(device)
+
         # 其余代码保持不变
         # 先处理连续动作情况，使用old_policy做一次act
         if self.has_continuous_action_space:
@@ -331,8 +339,7 @@ class HJB_PPO:
         # 折扣回报的计算方式，符合r = r + γΣr
         # reversed()反转操作
         # zip()将两个可迭代的对象配对到一起
-        print("奖励buffer", self.buffer.rewards)
-        print("终止buffer", self.buffer.is_terminals)
+
         for reward, is_terminal in zip(reversed(self.buffer.rewards), reversed(self.buffer.is_terminals)):
             if is_terminal:
                 # 当一个时间步是终止状态时，之后的折扣回报将从零开始计算,这里是翻转之后的，则应该表示终止之前的计算
@@ -347,15 +354,23 @@ class HJB_PPO:
         # rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
 
         # TODO: 每次更新重新计算advantage
+        # buffer中原本是众多连续的一维张量
         # convert list to tensor
-        # self.buffer.states中保存了一系列的状态值,为一个张量
         # .stack()声明了堆叠方式,将张量在第'dim=n'的方向上进行了堆叠,在这里是第0维(batch_size)维度
         # .squeeze()这个函数用于移除张量中维度为 1 的所有维度 (N,1)会变成(N,)
         # .detach()分离张量，使得它不再参与梯度计算，这是为了确保训练中的状态张量不再影响后续的梯度更新
         # 操作目的，将多个状态一起按同一批次进行处理
 
-        old_states = torch.squeeze(torch.stack(self.buffer.states, dim=0)).detach().to(device)
-        # buffer中原本是众多连续的一维张量
+        states_on_device = []
+        for state in self.buffer.states:
+            if isinstance(state, torch.Tensor):
+                # 如果已经是张量，确保它在正确的设备上
+                states_on_device.append(state.to(device))
+            else:
+                # 如果不是张量，将其转换为张量并放到正确的设备上
+                states_on_device.append(torch.tensor(state, dtype=torch.float32, device=device))
+        old_states = torch.squeeze(torch.stack(states_on_device, dim=0)).detach().to(device)  # 进行堆叠和其他操作
+
         # 检查并转换 self.buffer.actions 中的每个项
         actions_on_device = []
         for action in self.buffer.actions:
@@ -365,14 +380,8 @@ class HJB_PPO:
             else:
                 # 如果不是张量，将其转换为张量并放到正确的设备上
                 actions_on_device.append(torch.tensor(action, dtype=torch.float32, device=device))
+        old_actions = torch.squeeze(torch.stack(actions_on_device, dim=0)).detach().to(device)  # 进行堆叠和其他操作
 
-        """""""""
-        for i, action in enumerate(actions_on_device):
-            print(f"Action {i} shape: {action.shape}")
-        """
-
-        # 进行堆叠和其他操作
-        old_actions = torch.squeeze(torch.stack(actions_on_device, dim=0)).detach().to(device)
         old_logprobs = torch.squeeze(torch.stack(self.buffer.logprobs, dim=0)).detach().to(device)
         # old_state_values = torch.squeeze(torch.stack(self.buffer.state_values, dim=0)).detach().to(device)
 
@@ -384,8 +393,6 @@ class HJB_PPO:
         # Optimize policy for K epochs
         for _ in range(self.K_epochs):
             old_states = old_states.requires_grad_(True)  # 确保 old_states 可计算梯度
-            # delta_states = torch.squeeze(old_states[:, 1:, :] - old_states[:, -1, :]).detach()
-            delta_states = torch.squeeze(old_states[1:, :] - old_states[:-1, :]).detach()
             # Evaluating old actions and values，在新的policy下，评价老的数据。拿到一块时间步的logprobs, state_values
             # dist_entropy是网络内部的交叉熵，第三部分损失函数
             logprobs, state_values, dist_entropy = self.policy.evaluate(old_states, old_actions)
@@ -397,22 +404,28 @@ class HJB_PPO:
                 grad_outputs=torch.ones_like(state_values),  # 如果 `state_values` 不是标量，使用此项计算累积梯度
                 create_graph=True  # 如果你还需要计算更高阶的导数，则设置为 True
             )[0]
-            print("V(s)", state_values)
-            print("R(s, a)", rewards)
-            print("梯度", state_gradients)
 
             # match state_values tensor dimensions with rewards tensor
-            state_values = torch.squeeze(state_values).detach()
-            state_gradients = torch.squeeze(state_gradients).detach()
-            mse_f = torch.mean((state_values * torch.log(torch.tensor(self.gamma)) + rewards + state_gradients *
-                                delta_states / 0.01) ** 2)
+            # MSE_F
+            log_gamma = torch.log(torch.tensor(self.gamma))
+            # delta_states = torch.squeeze(old_states[:, 1:, :] - old_states[:, -1, :]).detach()
+            delta_states_f = torch.squeeze(old_states[1:, :] - old_states[:-1, :]).detach()
+            state_values_f = torch.squeeze(state_values[:-1]).detach()
+            state_gradients_f = torch.squeeze(state_gradients[:-1]).detach()
+            rewards_f = torch.squeeze(rewards[:-1]).detach()
 
-            rewards_t = torch.squeeze(rewards[:-1, :]).detach()  # r(t) 对应前面的时间步
-            state_values_t = torch.squeeze(state_values[:-1, :]).detach()
-            state_values_t1 = torch.squeeze(state_values[1:, :]).detach()  # v(t+1) 对应后面的时间步
-            mse_u = torch.mean((state_values_t - (rewards_t + self.gamma * state_values_t1)) ** 2)
+            # ▽_xV(x) * (x_t+1 - x_ t) / Δt
+            transition_value = torch.sum(state_gradients_f * delta_states_f, dim=1) / 0.01
+            mse_f = torch.mean((state_values_f * log_gamma + rewards_f + transition_value) ** 2)
 
-            loss_2 = 0.5 * mse_u + 0.5 * mse_f
+            # MSE_U
+            rewards_t = torch.squeeze(rewards[:-1]).detach()  # r(t) 对应前面的时间步
+            state_values_t = torch.squeeze(state_values[:-1]).detach()
+            state_values_t1 = torch.squeeze(state_values[1:]).detach()  # v(t+1) 对应后面的时间步
+            mse_u = torch.mean((state_values_t - (rewards_t + torch.tensor(self.gamma) * state_values_t1)) ** 2)
+
+            # 0.5 * MSE_u + λ_HJB * MSE_f
+            loss_2 = 0.5 * mse_u + self.hjb_lamda * mse_f
 
             # Finding the ratio (pi_theta / pi_theta__old)，因为带着个log所以用exp，评价新老policy的差异
             # exp(log(new)- log(old)) = new/old
@@ -472,46 +485,3 @@ class HJB_PPO:
         self.policy_old.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.policy.load_state_dict(self.policy_old.state_dict())  # Ensure both policies are synced
-
-
-# 假设你已经有了上述定义的 `HJB_PPO` 和其他类
-
-def test_hjb_ppo():
-    # 设置参数
-    state_dim = 4  # 状态空间维数
-    action_dim = 2  # 动作空间维数
-    lr_actor = 0.001  # actor学习率
-    lr_critic = 0.001  # critic学习率
-    gamma = 0.99  # 折扣因子
-    K_epochs = 3  # 更新的轮数
-    eps_clip = 0.2  # PPO裁剪率
-    action_std_init = 0.6  # 初始动作标准差
-    hidden_layer_dim = 128  # 隐藏层维数
-
-    # 实例化 PPO
-    hjb_ppo = HJB_PPO(state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip,
-                      has_continuous_action_space=True, action_std_init=action_std_init,
-                      hidden_layer_dim=hidden_layer_dim)
-
-    # 模拟状态和动作
-    for i in range(10):
-        state = torch.randn(state_dim).to(device)
-        # 选择动作
-        action = hjb_ppo.select_action(state)
-        hjb_ppo.buffer.rewards.append(5)
-        hjb_ppo.buffer.is_terminals.append(False)
-    state = torch.randn(state_dim).to(device)
-    # 选择动作
-    action = hjb_ppo.select_action(state)
-    hjb_ppo.buffer.is_terminals.append(True)
-    # 执行一次更新
-    hjb_ppo.update()
-
-    # 打印策略网络的参数
-    for name, param in hjb_ppo.policy.named_parameters():
-        if param.requires_grad:
-            print(f"{name} - {param.data}")
-
-
-# 运行测试
-test_hjb_ppo()
