@@ -283,22 +283,25 @@ class HJB_PPO:
         :return: 经过线性变换的action
         """
 
-        # 如果输入是字典，就展开
         if isinstance(input_state, dict):
             state = list(input_state.values())
         else:
             state = input_state
 
-        if isinstance(state, list):
+        if isinstance(state, np.ndarray):
             state = torch.tensor(state, dtype=torch.float32).to(device)
+        elif isinstance(state, list):
+            state = torch.tensor(state, dtype=torch.float32).to(device)
+        elif isinstance(state, torch.Tensor):
+            state = state.to(device)
+        else:
+            raise TypeError(f"Unsupported state type: {type(state)}")
 
         # 其余代码保持不变
         # 先处理连续动作情况，使用old_policy做一次act
         if self.has_continuous_action_space:
             # old_policy不保存梯度
             with torch.no_grad():
-                if not state.is_cuda:
-                    state = torch.FloatTensor(state).to(device)
                 # 走一步，保存动作、动作的log概率、value_function
                 action, action_logprob, state_val = self.policy_old.act(state)
 
@@ -361,6 +364,7 @@ class HJB_PPO:
         # .detach()分离张量，使得它不再参与梯度计算，这是为了确保训练中的状态张量不再影响后续的梯度更新
         # 操作目的，将多个状态一起按同一批次进行处理
 
+        # 检查并转换 self.buffer.states 中的每个项
         states_on_device = []
         for state in self.buffer.states:
             if isinstance(state, torch.Tensor):
@@ -382,7 +386,17 @@ class HJB_PPO:
                 actions_on_device.append(torch.tensor(action, dtype=torch.float32, device=device))
         old_actions = torch.squeeze(torch.stack(actions_on_device, dim=0)).detach().to(device)  # 进行堆叠和其他操作
 
-        step_rewards = torch.squeeze(torch.stack(self.buffer.rewards, dim=0)).detach().to(device)
+        # 检查并转换 self.buffer.rewards 中的每个项
+        step_rewards = []
+        for reward in self.buffer.rewards:
+            if isinstance(reward, torch.Tensor):
+                # 如果已经是张量，确保它在正确的设备上
+                step_rewards.append(reward.to(device))
+            else:
+                # 如果不是张量，将其转换为张量并放到正确的设备上
+                step_rewards.append(torch.tensor(reward, dtype=torch.float32, device=device))
+        step_rewards = torch.squeeze(torch.stack(step_rewards, dim=0)).detach().to(device)  # 进行堆叠和其他操作
+
         old_logprobs = torch.squeeze(torch.stack(self.buffer.logprobs, dim=0)).detach().to(device)
         # old_state_values = torch.squeeze(torch.stack(self.buffer.state_values, dim=0)).detach().to(device)
 
@@ -444,7 +458,6 @@ class HJB_PPO:
             loss = (-torch.min(surr1, surr2) + 0.5 * self.MseLoss(state_values, rewards) + loss_2 -
                     0.01 * dist_entropy)
 
-
             # 梯度优化过程
             self.optimizer.zero_grad()
             loss.mean().backward()
@@ -486,3 +499,4 @@ class HJB_PPO:
         self.policy_old.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.policy.load_state_dict(self.policy_old.state_dict())  # Ensure both policies are synced
+
