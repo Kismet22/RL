@@ -1,4 +1,6 @@
 import gym
+import my_ppo_net
+from my_ppo_net import Classic_PPO
 import hjbppo
 from hjbppo import HJB_PPO
 import os
@@ -11,24 +13,9 @@ import time
 
 # 将设备设置与hjbppo.py中相同
 device = hjbppo.device
-"""""""""
-env = gym.make('Swimmer-v4', render_mode='human')
-state = env.reset()
-state_dim = env.observation_space.shape[0]
-action_dim = env.action_space.shape[0]
-print("动作上限", env.action_space.high)
-print("动作下限", env.action_space.low)
-print("状态空间数", state_dim)
-print("动作空间数", action_dim)
-# Example loop to interact with the environment
-for _ in range(100):
-    action = env.action_space.sample()  # Random action
-    next_state, reward, terminated, truncated, info = env.step(action)
-    done = terminated or truncated
-    env.render()
-    if done:
-        break
-"""
+
+
+#device = my_ppo_net.device
 
 
 def train(model_id, render_mode=None):
@@ -87,7 +74,9 @@ def train(model_id, render_mode=None):
     lr_actor = 0.0001  # learning rate for actor network
     lr_critic = 0.0002  # learning rate for critic network
 
+    # seed = 0 开始状态不固定，随机初始化
     random_seed = 0  # set random seed if required (0 = no random seed)
+    # random_seed = 1
 
     pretrained_model_ID = model_id  # 训练ID, change this to prevent overwriting weights in same env_name folder
     #####################################################
@@ -115,9 +104,12 @@ def train(model_id, render_mode=None):
     ###################### 保存训练信息 ######################
     ###################### logging ######################
     # log files for multiple runs are NOT overwritten
-    # 强化学习方法文件夹
+
+    ###################### 强化学习方法文件夹 ######################
     log_dir = "HJB_PPO_logs"
-    # log_dir = "PPO_logs"
+    #log_dir = "PPO_logs"
+    ######################
+
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
 
@@ -131,9 +123,11 @@ def train(model_id, render_mode=None):
     # run_num = len(current_num_files)
 
     # create new log file for each run
-    # 训练过程记录文件
+    ######################  训练过程记录文件 ######################
     rl_method = '/HJB_PPO'
-    # rl_method = '/PPO'
+    #rl_method = '/PPO'
+    ######################
+
     log_f_name = log_dir + rl_method + env_name + "_log_" + str(pretrained_model_ID) + ".csv"
 
     print("current logging model ID for " + env_name + " : ", pretrained_model_ID)
@@ -144,13 +138,20 @@ def train(model_id, render_mode=None):
 
     ###################### 保存模型信息 ######################
     ################### checkpointing ###################
+
+    ######################  文件夹 ######################
     directory = "HJB_PPO_preTrained"
-    # directory = "PPO_preTrained"
+    #directory = "PPO_preTrained"
+    ######################
+
     if not os.path.exists(directory):
         os.makedirs(directory)
 
+    ######################  文件名 ######################
     method_name = "HJB_PPO_{}_ID_{}_seed_{}"
-    # method_name = "PPO_{}_ID_{}_seed_{}"
+    #method_name = "PPO_{}_ID_{}_seed_{}"
+    ######################
+
     directory = directory + '/' + env_name + '/' + method_name.format(env_name, pretrained_model_ID,
                                                                       random_seed) + '/'
     if not os.path.exists(directory):
@@ -198,10 +199,18 @@ def train(model_id, render_mode=None):
     ################# training procedure ################
 
     # initialize RL agent
+
     ppo_agent = HJB_PPO(state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip,
                         has_continuous_action_space,
                         action_std, continuous_action_output_scale=action_output_scale,
-                        continuous_action_output_bias=action_output_bias, hjb_lamda=0.1)
+                        continuous_action_output_bias=action_output_bias, hjb_lamda=0.4)
+
+    """""""""""
+    ppo_agent = Classic_PPO(state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip,
+                            has_continuous_action_space,
+                            action_std, continuous_action_output_scale=action_output_scale,
+                            continuous_action_output_bias=action_output_bias)
+    """
 
     # track total training time
     start_time = datetime.now().replace(microsecond=0)

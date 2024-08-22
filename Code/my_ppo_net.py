@@ -186,11 +186,11 @@ class ActorCritic(nn.Module):
         return action_logprobs, state_values, dist_entropy
 
 
-class HJB_PPO:
+class Classic_PPO:
     def __init__(self, state_dim, action_dim, lr_actor, lr_critic,
                  gamma, K_epochs, eps_clip, has_continuous_action_space,
                  action_std_init=0.6, hidden_layer_dim=128,
-                 continuous_action_output_scale=1.0, continuous_action_output_bias=0.0, hjb_lamda=0.5):
+                 continuous_action_output_scale=1.0, continuous_action_output_bias=0.0):
         """
         PPO constructor.
         :param state_dim: 状态空间维数
@@ -245,7 +245,6 @@ class HJB_PPO:
 
         # 第二部分的损失值:A2C网络的MSE损失值
         self.MseLoss = nn.MSELoss()
-        self.hjb_lamda = hjb_lamda
 
     def set_action_std(self, new_action_std):
         if self.has_continuous_action_space:
@@ -385,65 +384,29 @@ class HJB_PPO:
                 # 如果不是张量，将其转换为张量并放到正确的设备上
                 actions_on_device.append(torch.tensor(action, dtype=torch.float32, device=device))
         old_actions = torch.squeeze(torch.stack(actions_on_device, dim=0)).detach().to(device)  # 进行堆叠和其他操作
-
-        # 检查并转换 self.buffer.rewards 中的每个项
-        step_rewards = []
-        for reward in self.buffer.rewards:
-            if isinstance(reward, torch.Tensor):
-                # 如果已经是张量，确保它在正确的设备上
-                step_rewards.append(reward.to(device))
-            else:
-                # 如果不是张量，将其转换为张量并放到正确的设备上
-                step_rewards.append(torch.tensor(reward, dtype=torch.float32, device=device))
-        step_rewards = torch.squeeze(torch.stack(step_rewards, dim=0)).detach().to(device)  # 进行堆叠和其他操作
-
         old_logprobs = torch.squeeze(torch.stack(self.buffer.logprobs, dim=0)).detach().to(device)
         old_state_values = torch.squeeze(torch.stack(self.buffer.state_values, dim=0)).detach().to(device)
 
         # calculate advantages
+        # Finding Surrogate Loss
+        # PPO第一部分损失函数的计算过程
+        # A(a|s)为r与critic_value的差值
         # old_state_values是老的critic网络对每个状态的v值估计，而rewards是经过采样【且归一化】后的真实reward
         advantages = rewards.detach() - old_state_values.detach()
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-7)
 
         # Optimize policy for K epochs
+        # 在K轮epochs中，优势函数不改变
         for _ in range(self.K_epochs):
             old_states = old_states.requires_grad_(True)  # 确保 old_states 可计算梯度
             # Evaluating old actions and values，在新的policy下，评价老的数据。拿到一块时间步的logprobs, state_values
             # dist_entropy是网络内部的交叉熵，第三部分损失函数
             logprobs, state_values, dist_entropy = self.policy.evaluate(old_states, old_actions)
 
-            # 计算 `state_values` 对 `old_states` 的梯度
-            state_gradients = torch.autograd.grad(
-                outputs=state_values,  # 目标输出，即对谁求导
-                inputs=old_states,  # 输入，即相对于谁求导
-                grad_outputs=torch.ones_like(state_values),  # 如果 `state_values` 不是标量，使用此项计算累积梯度
-                create_graph=True  # 如果你还需要计算更高阶的导数，则设置为 True
-            )[0]
-
-            # match state_values tensor dimensions with rewards tensor
-            # MSE_F
-            log_gamma = torch.log(torch.tensor(self.gamma))
-            # delta_states = torch.squeeze(old_states[:, 1:, :] - old_states[:, -1, :]).detach()
-            delta_states_f = torch.squeeze(old_states[1:, :] - old_states[:-1, :]).detach()
-            state_values_f = torch.squeeze(state_values[:-1]).detach()
-            state_gradients_f = torch.squeeze(state_gradients[:-1]).detach()
-            rewards_f = torch.squeeze(step_rewards[:-1]).detach()
-
-            # ▽_xV(x) * (x_t+1 - x_ t) / Δt
-            transition_value = torch.sum(state_gradients_f * delta_states_f, dim=1) / 0.01
-            mse_f = torch.mean((state_values_f * log_gamma + rewards_f + transition_value) ** 2)
-
-            # MSE_U
-            state_values_t = torch.squeeze(state_values[:-1]).detach()
-            state_values_t1 = torch.squeeze(state_values[1:]).detach()  # v(t+1) 对应后面的时间步
-            mse_u = torch.mean((state_values_t - (rewards_f + torch.tensor(self.gamma) * state_values_t1)) ** 2)
-
-            # 0.5 * MSE_u + λ_HJB * MSE_f
-            loss_2 = 0.5 * mse_u + self.hjb_lamda * mse_f
-
             # Finding the ratio (pi_theta / pi_theta__old)，因为带着个log所以用exp，评价新老policy的差异
             # exp(log(new)- log(old)) = new/old
             ratios = torch.exp(logprobs - old_logprobs.detach())
+
             """""""""
             # Finding Surrogate Loss
             # PPO第一部分损失函数的计算过程
@@ -457,11 +420,7 @@ class HJB_PPO:
             # final loss of clipped objective PPO
             # 第一项是给actor网络用的，第二项是给critic网络用的，第三项也是给actor的，避免策略过早收敛。
             # 虽然loss写在了一起，但两个网络会各自计算和自己相关的梯度，这没什么问题。
-            """""""""
-            loss = (-torch.min(surr1, surr2) + 0.5 * self.MseLoss(state_values, rewards) + loss_2 -
-                    0.01 * dist_entropy)
-            """
-            loss = -torch.min(surr1, surr2) + loss_2
+            loss = -torch.min(surr1, surr2) + 0.5 * self.MseLoss(state_values, rewards) - 0.01 * dist_entropy
 
             # 梯度优化过程
             self.optimizer.zero_grad()
@@ -504,4 +463,3 @@ class HJB_PPO:
         self.policy_old.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.policy.load_state_dict(self.policy_old.state_dict())  # Ensure both policies are synced
-
